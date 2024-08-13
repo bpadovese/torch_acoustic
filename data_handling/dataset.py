@@ -1,5 +1,6 @@
 import tables
 import torch
+from torchvision import transforms
 from torch.utils.data import Dataset
 
 class HDF5Dataset(Dataset):
@@ -13,10 +14,10 @@ class HDF5Dataset(Dataset):
         self.labels = self.table.col('label')
 
         # Retrieve min and max values from table attributes
-        self.min_value = self.table.attrs.min_value
-        self.max_value = self.table.attrs.max_value
-        self.mean_value = self.table.attrs.mean_value
-        self.std_value = self.table.attrs.std_value
+        self.min_value = self.table.attrs.min_value if hasattr(self.table.attrs, 'min_value') else None
+        self.max_value = self.table.attrs.max_value if hasattr(self.table.attrs, 'max_value') else None
+        self.mean_value = self.table.attrs.mean_value if hasattr(self.table.attrs, 'mean_value') else None
+        self.std_value = self.table.attrs.std_value if hasattr(self.table.attrs, 'std_value') else None
 
     def __len__(self):
         return len(self.data)
@@ -68,3 +69,35 @@ class Standardize:
         std = self.std if self.std is not None else tensor.std()
         tensor = (tensor - mean) / std
         return tensor
+
+class MedianNormalize:
+    def __init__(self, axis=None):
+        """
+        Initialize the MedianNormalize class.
+
+        Args:
+            axis (int or None): The axis along which to compute the median.
+                                - If axis=0, normalize by column medians.
+                                - If axis=1, normalize by row medians.
+                                - If axis=None, normalize globally by the median.
+        """
+        self.axis = axis
+
+    def __call__(self, tensor):
+        if self.axis is not None:
+            median = torch.median(tensor, dim=self.axis, keepdim=True).values
+        else:
+            median = torch.median(tensor)
+        
+        tensor = tensor - median
+        return tensor
+
+class ConditionalResize:
+    def __init__(self, target_size):
+        self.target_size = target_size
+        self.resize_transform = transforms.Resize(target_size)
+
+    def __call__(self, image):
+        if image.size != self.target_size:
+            return self.resize_transform(image)
+        return image
