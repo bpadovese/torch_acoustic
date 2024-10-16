@@ -3,13 +3,26 @@ import torch
 from torchvision import transforms
 from torch.utils.data import Dataset
 
+def get_leaf_paths(hdf5_file, table_path):
+    with tables.open_file(hdf5_file, mode='r') as file:
+        group = file.get_node(table_path)
+        leaf_paths = []
+
+        if isinstance(group, tables.Leaf):
+            leaf_paths.append(table_path)
+        elif isinstance(group, tables.Group):
+            for node in file.walk_nodes(group, classname='Leaf'):
+                leaf_paths.append(node._v_pathname)
+                
+        return leaf_paths
+    
 class HDF5Dataset(Dataset):
     def __init__(self, hdf5_file, table_name, transform=None):
         self.hdf5_file = hdf5_file
         self.table_name = table_name
         self.transform = transform
         self.file = tables.open_file(hdf5_file, mode='r')
-        self.table = self.file.get_node(f'{table_name}/data')
+        self.table = self.file.get_node(table_name)
         self.data = self.table.col('data')
         self.labels = self.table.col('label')
 

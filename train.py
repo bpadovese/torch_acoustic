@@ -3,16 +3,19 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as transforms
+import re
 import numpy as np
-from data_handling.dataset import HDF5Dataset, NormalizeToRange, Standardize, MedianNormalize, ConditionalResize
+from data_handling.dataset import HDF5Dataset, NormalizeToRange, Standardize, MedianNormalize, ConditionalResize, get_leaf_paths
 from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler
 from pathlib import Path
+from collections import Counter
 from torchinfo import summary
 from diffusers.optimization import get_cosine_schedule_with_warmup 
 from lightning.fabric import Fabric
 from lightning.fabric.loggers import CSVLogger
 import torcheval.metrics as metrics
 from torch.optim.lr_scheduler import CosineAnnealingLR
+# from torchtune.modules import get_cosine_schedule_with_warmup
 
 
 def resnet18_for_single_channel():
@@ -27,13 +30,40 @@ def resnet18_for_single_channel():
 
     return model
 
-def create_weighted_sampler(dataset):
-    # Assuming dataset.targets contains the labels
-    class_counts = np.bincount(dataset.labels)
-    class_weights = 1. / class_counts
-    sample_weights = class_weights[dataset.labels]
+def get_concat_dataset_labels(concat_dataset):
+    """
+    Extract labels from each dataset in a ConcatDataset and return them as a single tensor.
+    """
+    all_labels = []
+    for dataset in concat_dataset.datasets:  # Access each dataset in the ConcatDataset
+        all_labels.append(torch.tensor(dataset.labels))  # Assuming each HDF5Dataset has a 'labels' attribute
+    return torch.cat(all_labels)  # Concatenate all label tensors
 
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+def create_weighted_sampler(dataset):
+    # Get all labels from the ConcatDataset
+    labels = get_concat_dataset_labels(dataset)
+
+    # Get unique labels and their counts
+    unique_labels, class_counts = torch.unique(labels, return_counts=True)
+
+    # Calculate class weights (inverse of the frequency)
+    class_weights = 1.0 / class_counts.float()
+    
+    # Create a mapping from label to weight
+    label_to_weight = {label.item(): weight for label, weight in zip(unique_labels, class_weights)}
+
+    # Assign sample weights based on class weights
+    sample_weights = torch.tensor([label_to_weight[label.item()] for label in labels], dtype=torch.float)
+
+    # Calculate num_samples: minimum class count times the number of classes
+    min_class_count = class_counts.min().item()  # Get the minimum count as an integer
+    num_classes = len(class_counts)  # Number of unique classes
+    num_samples = min_class_count * num_classes  # Total samples to draw per epoch
+
+    # Create the WeightedRandomSampler
+    sampler = WeightedRandomSampler(weights=sample_weights, 
+                                    num_samples=num_samples, 
+                                    replacement=False)
     return sampler
 
 def train(fabric, model, optimizer, loss_func, train_loader, lr_scheduler=None, val_loader=None, num_epochs=20, num_classes=2):
@@ -41,36 +71,80 @@ def train(fabric, model, optimizer, loss_func, train_loader, lr_scheduler=None, 
     for epoch in range(num_epochs):
         start_time = time.time()  # Start timer
         model.train()
-        train_loss = train_epoch(fabric, model, optimizer, loss_func, train_loader, epoch, lr_scheduler=lr_scheduler)
+
+        # Training step
+        train_loss, train_accuracy, train_precision, train_recall = train_epoch(
+            fabric, model, optimizer, loss_func, train_loader, epoch, lr_scheduler=lr_scheduler, num_classes=num_classes
+        )
+
         # Validation step
-        avg_val_loss, val_accuracy, val_precision, val_recall = validate(fabric, model, val_loader, loss_func, num_classes)
+        avg_val_loss, val_accuracy, val_precision, val_recall = validate(
+            fabric, model, val_loader, loss_func, num_classes
+        )
+
         end_time = time.time()  # End timer
         epoch_duration = end_time - start_time
-        print(f'Epoch {epoch + 1}, Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%, Validation Precision: {val_precision:.4f}, Validation Recall: {val_recall:.4f}, Duration: {epoch_duration:.2f} seconds')
+
+        print(f'Epoch {epoch + 1}, Training Loss: {train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}')
+        print(f'Training Accuracy: {train_accuracy:.2f}%, Training Precision: {train_precision:.4f}, Training Recall: {train_recall:.4f}')
+        print(f'Validation Accuracy: {val_accuracy:.2f}%, Validation Precision: {val_precision:.4f}, Validation Recall: {val_recall:.4f}')
+        print(f'Epoch Duration: {epoch_duration:.2f} seconds')
+        print()
 
         # Log metrics
         fabric.log_dict({
             'epoch': epoch + 1,
             'train_loss': train_loss,
+            'train_accuracy': train_accuracy,
+            'train_precision': train_precision,
+            'train_recall': train_recall,
             'validation_loss': avg_val_loss,
             'validation_accuracy': val_accuracy,
             'validation_precision': val_precision,
             'validation_recall': val_recall,
         })
 
-def train_epoch(fabric, model, optimizer, loss_func, train_loader, epoch, lr_scheduler=None):
+def train_epoch(fabric, model, optimizer, loss_func, train_loader, epoch, lr_scheduler=None, num_classes=2):
     running_loss = 0.0
+
+    # Initialize metrics
+    precision_metric = metrics.MulticlassPrecision(num_classes=num_classes, average=None).to(fabric.device)
+    recall_metric = metrics.MulticlassRecall(num_classes=num_classes, average=None).to(fabric.device)
+    accuracy_metric = metrics.MulticlassAccuracy(num_classes=num_classes, average='macro').to(fabric.device)
+
     for batch_idx, (inputs,labels) in enumerate(train_loader, 0):
+        # Zero the parameter gradients
         optimizer.zero_grad()
+        # Forward pass
         outputs = model(inputs)
+        # Compute loss
         loss = loss_func(outputs, labels)
         fabric.backward(loss)
+        # Step optimizer
         optimizer.step()
-        lr_scheduler.step()
+        # Step learning rate scheduler if provided
+        if lr_scheduler:
+            lr_scheduler.step()
+        # Update running loss
         running_loss += loss.item()
+
+        # Update metrics
+        precision_metric.update(outputs, labels)
+        recall_metric.update(outputs, labels)
+        accuracy_metric.update(outputs, labels)
+
+    # Compute average loss for the epoch
     avg_loss = running_loss / len(train_loader)
-    print(f'Epoch {epoch + 1}, Loss: {avg_loss}')
-    return avg_loss 
+
+    # Compute metrics for the entire epoch
+    precision = precision_metric.compute()
+    recall = recall_metric.compute()
+    accuracy = accuracy_metric.compute().item()
+
+    precision = precision[1].item()  # Precision for class 1 (KW)
+    recall = recall[1].item()  # Recall for class 1 (KW)
+    
+    return avg_loss, accuracy, precision, recall 
 
 
 @torch.no_grad()
@@ -78,9 +152,9 @@ def validate(fabric, model, dataloader, loss_func, num_classes):
     model.eval()
     test_loss = 0
 
-    precision_metric = metrics.MulticlassPrecision(num_classes=num_classes, average='micro').to(fabric.device)
-    recall_metric = metrics.MulticlassRecall(num_classes=num_classes, average='micro').to(fabric.device)
-    accuracy_metric = metrics.MulticlassAccuracy(num_classes=num_classes, average='micro').to(fabric.device)
+    precision_metric = metrics.MulticlassPrecision(num_classes=num_classes, average=None).to(fabric.device)
+    recall_metric = metrics.MulticlassRecall(num_classes=num_classes, average=None).to(fabric.device)
+    accuracy_metric = metrics.MulticlassAccuracy(num_classes=num_classes, average='macro').to(fabric.device)
 
     for inputs, labels in dataloader:
         outputs = model(inputs)
@@ -90,11 +164,14 @@ def validate(fabric, model, dataloader, loss_func, num_classes):
         recall_metric.update(outputs, labels)
         accuracy_metric.update(outputs, labels)
 
-    avg_val_loss = test_loss / len(dataloader.dataset)
-    precision = precision_metric.compute().item()
-    recall = recall_metric.compute().item()
+    # avg_val_loss = test_loss / len(dataloader.dataset)
+    avg_val_loss = test_loss / len(dataloader)
+    precision = precision_metric.compute()
+    recall = recall_metric.compute()
     accuracy = accuracy_metric.compute().item()
-
+    
+    precision = precision[1].item()
+    recall = recall[1].item()
     return avg_val_loss, accuracy, precision, recall
 
 def select_transform(norm_type, dataset_min=None, dataset_max=None, dataset_mean=None, dataset_std=None):
@@ -140,7 +217,24 @@ def select_transform(norm_type, dataset_min=None, dataset_max=None, dataset_mean
         case _:
             return None  # Fallback: no operation (same as case 0)
 
-def main(dataset, train_table='/train', aug_table=None, val_table='/test', output_folder=None, train_batch_size=32, eval_batch_size=32, num_epochs=20, model_name='my_model', norm_type=2, norm_type_aug=0, dataset_stats=None):
+def get_next_version(model_name, output_folder):
+    """
+    Finds the highest version of the model in the output folder and returns the next version number.
+    """
+    # Using a regular expression to match model versions like 'model_vX.pt'
+    version_pattern = re.compile(rf"{model_name}_v(\d+)\.pt")
+
+    # List all model files in the output folder
+    version_numbers = []
+    for file in output_folder.iterdir():
+        match = version_pattern.match(file.name)
+        if match:
+            version_numbers.append(int(match.group(1)))
+
+    # Return the next version number or 0
+    return max(version_numbers, default=-1) + 1
+
+def main(dataset, train_table='/train', aug_table=None, val_table='/test', output_folder=None, train_batch_size=32, eval_batch_size=32, num_epochs=20, model_name='my_model', norm_type=2, norm_type_aug=0, versioning=False, dataset_stats=None):
     
     if output_folder is None:
         output_folder = Path('.').resolve()
@@ -155,56 +249,84 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
     fabric = Fabric(loggers=logger)
     num_classes = 2
 
-    if model_name is None:
-        model_name = "my_model.pt"
+    # Model file naming logic based on versioning parameter
+    if versioning:
+        # If versioning is True, version the model by checking existing files
+        version = get_next_version(model_name, output_folder)
+
+        model_path = output_folder / f"{model_name}_v{version}.pt"
+    else:
+        # If versioning is False, always use the same model name
+        model_path = output_folder / f"{model_name}.pt"
+        
+
+    # if model_name is None:
+    #     model_name = "my_model.pt"
     
-    model_path = output_folder / model_name
-    if not model_path.suffix:
-        model_path = model_path.with_suffix('.pt')
+    # model_path = output_folder / model_name
+    # if not model_path.suffix:
+    #     model_path = model_path.with_suffix('.pt')
+
+    
 
     # train_dataset = HDF5Dataset(dataset, train_table, transform=None)
     # test_dataset = HDF5Dataset(dataset, val_table, transform=None)
+    dataset_min = None
+    dataset_max = None
+    dataset_mean = None
+    dataset_std = None
 
+    # Select transforms for the training dataset
+    train_transform = select_transform(norm_type, dataset_min, dataset_max, dataset_mean, dataset_std)
+
+    train_datasets = []
     # Handle train_table argument (single path or list of paths)
     if isinstance(train_table, str):
         train_table = [train_table]  # Convert to list if it's a single path
-    train_datasets = [HDF5Dataset(dataset, path, transform=None) for path in train_table]
+    for path in train_table:
+        leaf_paths = get_leaf_paths(dataset, path)
+        for leaf_path in leaf_paths:
+            train_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
+            train_ds.set_transform(train_transform)
+            train_datasets.append(train_ds)
+    # train_datasets = [HDF5Dataset(dataset, path, transform=None) for path in train_table]
     train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
 
+    val_datasets = []
     # Handle val_table argument (single path or list of paths)
     if isinstance(val_table, str):
         val_table = [val_table]  # Convert to list if it's a single path
-    val_datasets = [HDF5Dataset(dataset, path, transform=None) for path in val_table]
+    for path in val_table:
+        leaf_paths = get_leaf_paths(dataset, path)
+        for leaf_path in leaf_paths:
+            val_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
+            val_ds.set_transform(train_transform)
+            val_datasets.append(val_ds)
+    # val_datasets = [HDF5Dataset(dataset, path, transform=None) for path in val_table]
     test_dataset = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
 
     # Optional: Handle augmented dataset
     aug_dataset = None
     if aug_table:
-        aug_dataset = HDF5Dataset(dataset, aug_table, transform=None)
+        aug_dataset = HDF5Dataset(dataset, aug_table + '/data', transform=None)
 
     # Get the dataset-level statistics for feature-wise normalization/standardization
-    dataset_min = train_dataset.min_value
-    dataset_max = train_dataset.max_value
-    dataset_mean = train_dataset.mean_value
-    dataset_std = train_dataset.std_value
-
-    # Select transforms for the training dataset
-    train_transform = select_transform(norm_type, dataset_min, dataset_max, dataset_mean, dataset_std)
-
-    train_dataset.set_transform(train_transform)
-    test_dataset.set_transform(train_transform)
+    # dataset_min = train_dataset.min_value
+    # dataset_max = train_dataset.max_value
+    # dataset_mean = train_dataset.mean_value
+    # dataset_std = train_dataset.std_value
+    
     
     # Now select the transforms for the augemtned set
     if aug_dataset:
         aug_transform = select_transform(norm_type_aug, dataset_min, dataset_max, dataset_mean, dataset_std)
         aug_dataset.set_transform(aug_transform)
-
-    train_dataset = ConcatDataset([train_dataset, aug_dataset])
+        train_dataset = ConcatDataset([train_dataset, aug_dataset])
         
     # Create a WeightedRandomSampler for balanced sampling
-    # train_sampler = create_weighted_sampler(train_dataset)
-    train_sampler = None
-    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, sampler=train_sampler)
+    train_sampler = create_weighted_sampler(train_dataset)
+    # train_sampler = None
+    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=False, sampler=train_sampler)
     test_loader = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False)
 
     train_loader, test_loader = fabric.setup_dataloaders(train_loader, test_loader)
@@ -220,24 +342,40 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
         num_warmup_steps=500,
         num_training_steps=(len(train_loader) * num_epochs),
     )
-
+    # lr_scheduler = None
     model, optimizer, lr_scheduler = fabric.setup(model, optimizer, lr_scheduler)
+    # model, optimizer = fabric.setup(model, optimizer)
+    
 
     train(fabric, model, optimizer, loss_func, train_loader, val_loader=test_loader, lr_scheduler=lr_scheduler, num_epochs=num_epochs, num_classes=num_classes)
 
     logger.finalize("success")
-    torch.save(model.state_dict(), model_path)
+    
+    state = { # fabric will automatically unwrap the state_dict() when necessary
+        "model": model, #necessary
+        "optimizer": optimizer, 
+        "lr_scheduler": lr_scheduler, 
+        "epoch": num_epochs
+    }
+    fabric.save(model_path, state)
+    # torch.save(model.state_dict(), model_path)
     
     print('Finished Training')
 
 # Example usage
 if __name__ == "__main__":
     import argparse
+
+    def boolean_string(s):
+        if s not in {'False', 'True'}:
+            raise ValueError('Not a valid boolean string')
+        return s == 'True'
+    
     parser = argparse.ArgumentParser(description='Train a model on HDF5 dataset.')
     parser.add_argument('dataset', help='Path to the HDF5 dataset file.')
-    parser.add_argument('--train_table', default='/train', help='HDF5 table name for training data.')
+    parser.add_argument('--train_table', type=str, nargs='+', default='/train', help='HDF5 table name for training data.')
     parser.add_argument('--aug_table', type=str, default=None, help='HDF5 table name for augmented data, this assumes a different set of transformations will apply.')
-    parser.add_argument('--val_table', default='/test', help='HDF5 table name for validation data.')
+    parser.add_argument('--val_table', type=str, nargs='+', default='/test', help='HDF5 table name for validation data.')
     parser.add_argument('--output_folder', default=None, type=str, help='Folder to save the trained model.')
     parser.add_argument('--train_batch_size', type=int, default=32, help='Batch size for training.')
     parser.add_argument('--eval_batch_size', type=int, default=32, help='Batch size for evaluation.')
@@ -253,8 +391,9 @@ if __name__ == "__main__":
     parser.add_argument('--norm_type_aug', type=int, default=0, help='Norm that will apply for the augmetned data')
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs.')
     parser.add_argument('--model_name', type=str, default='my_model', help='name of the model')
+    parser.add_argument('--versioning', type=boolean_string, default='False', help='If True, the model name will be versioned (e.g., v_0, v_1, etc.) based on the models already saved in the output path.')
 
     args = parser.parse_args()
     main(args.dataset, train_table=args.train_table, aug_table=args.aug_table, val_table=args.val_table, output_folder=args.output_folder, 
          train_batch_size=args.train_batch_size, eval_batch_size=args.eval_batch_size, norm_type=args.norm_type, 
-         norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, model_name=args.model_name)
+         norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, model_name=args.model_name, versioning=args.versioning)
