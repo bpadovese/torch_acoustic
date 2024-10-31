@@ -258,19 +258,7 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
     else:
         # If versioning is False, always use the same model name
         model_path = output_folder / f"{model_name}.pt"
-        
-
-    # if model_name is None:
-    #     model_name = "my_model.pt"
-    
-    # model_path = output_folder / model_name
-    # if not model_path.suffix:
-    #     model_path = model_path.with_suffix('.pt')
-
-    
-
-    # train_dataset = HDF5Dataset(dataset, train_table, transform=None)
-    # test_dataset = HDF5Dataset(dataset, val_table, transform=None)
+   
     dataset_min = None
     dataset_max = None
     dataset_mean = None
@@ -289,8 +277,7 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
             train_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
             train_ds.set_transform(train_transform)
             train_datasets.append(train_ds)
-    # train_datasets = [HDF5Dataset(dataset, path, transform=None) for path in train_table]
-    train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    # train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
 
     val_datasets = []
     # Handle val_table argument (single path or list of paths)
@@ -302,27 +289,20 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
             val_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
             val_ds.set_transform(train_transform)
             val_datasets.append(val_ds)
-    # val_datasets = [HDF5Dataset(dataset, path, transform=None) for path in val_table]
     test_dataset = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
 
-    # Optional: Handle augmented dataset
+    # Optional: Handle augmented dataset and apply transforms
     aug_dataset = None
     if aug_table:
         aug_dataset = HDF5Dataset(dataset, aug_table + '/data', transform=None)
-
-    # Get the dataset-level statistics for feature-wise normalization/standardization
-    # dataset_min = train_dataset.min_value
-    # dataset_max = train_dataset.max_value
-    # dataset_mean = train_dataset.mean_value
-    # dataset_std = train_dataset.std_value
-    
-    
-    # Now select the transforms for the augemtned set
-    if aug_dataset:
+        # Select the transforms for the augmented set
         aug_transform = select_transform(norm_type_aug, dataset_min, dataset_max, dataset_mean, dataset_std)
         aug_dataset.set_transform(aug_transform)
-        train_dataset = ConcatDataset([train_dataset, aug_dataset])
-        
+        train_datasets.append(aug_dataset)
+    
+    # Concating all train datasets together.
+    train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    
     # Create a WeightedRandomSampler for balanced sampling
     train_sampler = create_weighted_sampler(train_dataset)
     # train_sampler = None
