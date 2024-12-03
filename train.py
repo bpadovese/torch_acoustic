@@ -8,7 +8,7 @@ import numpy as np
 from data_handling.dataset import HDF5Dataset, NormalizeToRange, Standardize, MedianNormalize, ConditionalResize, get_leaf_paths
 from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler
 from pathlib import Path
-from collections import Counter
+from collections import defaultdict
 from torchinfo import summary
 from diffusers.optimization import get_cosine_schedule_with_warmup 
 from lightning.fabric import Fabric
@@ -30,40 +30,68 @@ def resnet18_for_single_channel():
 
     return model
 
-def get_concat_dataset_labels(concat_dataset):
+def compute_class_counts(concat_dataset):
     """
-    Extract labels from each dataset in a ConcatDataset and return them as a single tensor.
-    """
-    all_labels = []
-    for dataset in concat_dataset.datasets:  # Access each dataset in the ConcatDataset
-        all_labels.append(torch.tensor(dataset.labels))  # Assuming each HDF5Dataset has a 'labels' attribute
-    return torch.cat(all_labels)  # Concatenate all label tensors
+    Computes the class counts across multiple HDF5Dataset objects by 
+    reading only the first label from each table and using the `nrows` attribute.
 
-def create_weighted_sampler(dataset):
-    # Get all labels from the ConcatDataset
-    labels = get_concat_dataset_labels(dataset)
-
-    # Get unique labels and their counts
-    unique_labels, class_counts = torch.unique(labels, return_counts=True)
-
-    # Calculate class weights (inverse of the frequency)
-    class_weights = 1.0 / class_counts.float()
+    Note: Assumes that each table corresponds to a single label.
     
-    # Create a mapping from label to weight
-    label_to_weight = {label.item(): weight for label, weight in zip(unique_labels, class_weights)}
+    Args:
+        datasets: ConcatDatset of HDF5Dataset objects.
+        
+    Returns:
+        label list
+        Dictionary mapping class labels to their respective counts.
+    """
+    labels = []
+    class_counts = defaultdict(int)
+
+    for dataset in concat_dataset.datasets:
+        # Read the first label to determine the class
+        first_label = dataset[0][1].item()  # Fetch the label of the first sample
+        
+        # Use the `nrows` attribute to determine the number of samples in the table
+        table_size = dataset.table.nrows
+        labels.extend([first_label] * table_size)
+        # Add the number of samples to the appropriate class
+        class_counts[first_label] += table_size
+    
+    return labels, class_counts
+
+def create_weighted_sampler(datasets):
+    """
+    Create a WeightedRandomSampler based on class counts.
+
+    Args:
+        class_counts: Dictionary of class counts.
+
+    Returns:
+        WeightedRandomSampler object.
+    """
+
+    labels, class_counts = compute_class_counts(datasets)
+
+    # Calculate class weights (inverse of frequency)
+    total_samples = sum(class_counts.values())
+    class_weights = {cls: total_samples / count for cls, count in class_counts.items()}
 
     # Assign sample weights based on class weights
-    sample_weights = torch.tensor([label_to_weight[label.item()] for label in labels], dtype=torch.float)
+    sample_weights = torch.tensor(
+        [class_weights[label] for label in labels], dtype=torch.float
+    )
 
     # Calculate num_samples: minimum class count times the number of classes
-    min_class_count = class_counts.min().item()  # Get the minimum count as an integer
-    num_classes = len(class_counts)  # Number of unique classes
-    num_samples = min_class_count * num_classes  # Total samples to draw per epoch
+    min_class_count = min(class_counts.values())
+    num_samples = int(min_class_count * len(class_counts))   # Total samples to draw per epoch
 
     # Create the WeightedRandomSampler
-    sampler = WeightedRandomSampler(weights=sample_weights, 
-                                    num_samples=num_samples, 
-                                    replacement=False)
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=num_samples,  # Total number of samples
+        replacement=False
+    )
+
     return sampler
 
 def train(fabric, model, optimizer, loss_func, train_loader, lr_scheduler=None, val_loader=None, num_epochs=20, num_classes=2):
@@ -113,6 +141,9 @@ def train_epoch(fabric, model, optimizer, loss_func, train_loader, epoch, lr_sch
     accuracy_metric = metrics.MulticlassAccuracy(num_classes=num_classes, average='macro').to(fabric.device)
 
     for batch_idx, (inputs,labels) in enumerate(train_loader, 0):
+        # Count labels for each class
+        # class_counts = {cls: (labels == cls).sum().item() for cls in range(num_classes)} # DEBUGGING
+        # print(f"Batch {batch_idx} class counts: {class_counts}")
         # Zero the parameter gradients
         optimizer.zero_grad()
         # Forward pass
@@ -267,6 +298,7 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
     # Select transforms for the training dataset
     train_transform = select_transform(norm_type, dataset_min, dataset_max, dataset_mean, dataset_std)
 
+    print("Loading train dataset...")
     train_datasets = []
     # Handle train_table argument (single path or list of paths)
     if isinstance(train_table, str):
@@ -279,6 +311,7 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
             train_datasets.append(train_ds)
     # train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
 
+    print("Loading val dataset...")
     val_datasets = []
     # Handle val_table argument (single path or list of paths)
     if isinstance(val_table, str):
@@ -291,6 +324,7 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
             val_datasets.append(val_ds)
     test_dataset = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
 
+    print("Loading augmentation dataset...")
     # Optional: Handle augmented dataset and apply transforms
     aug_dataset = None
     if aug_table:
@@ -300,15 +334,18 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
         aug_dataset.set_transform(aug_transform)
         train_datasets.append(aug_dataset)
     
+
     # Concating all train datasets together.
     train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
     
     # Create a WeightedRandomSampler for balanced sampling
     train_sampler = create_weighted_sampler(train_dataset)
-    # train_sampler = None
-    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=False, sampler=train_sampler)
-    test_loader = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False)
 
+    print("Setting up Fabric...")
+    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=False, sampler=train_sampler, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=4)
+
+    print("Setting up DataLoaders...")
     train_loader, test_loader = fabric.setup_dataloaders(train_loader, test_loader)
     
 
@@ -326,7 +363,6 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
     model, optimizer, lr_scheduler = fabric.setup(model, optimizer, lr_scheduler)
     # model, optimizer = fabric.setup(model, optimizer)
     
-
     train(fabric, model, optimizer, loss_func, train_loader, val_loader=test_loader, lr_scheduler=lr_scheduler, num_epochs=num_epochs, num_classes=num_classes)
 
     logger.finalize("success")

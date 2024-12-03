@@ -23,8 +23,6 @@ class HDF5Dataset(Dataset):
         self.transform = transform
         self.file = tables.open_file(hdf5_file, mode='r')
         self.table = self.file.get_node(table_name)
-        self.data = self.table.col('data')
-        self.labels = self.table.col('label')
 
         # Retrieve min and max values from table attributes
         self.min_value = self.table.attrs.min_value if hasattr(self.table.attrs, 'min_value') else None
@@ -33,11 +31,12 @@ class HDF5Dataset(Dataset):
         self.std_value = self.table.attrs.std_value if hasattr(self.table.attrs, 'std_value') else None
 
     def __len__(self):
-        return len(self.data)
+        return self.table.nrows
 
     def __getitem__(self, idx):
-        spectrogram = self.data[idx]
-        label = self.labels[idx]
+        row = self.table[idx]  # Fetch the row dynamically
+        spectrogram = row['data']
+        label = row['label']
         
         # Convert to tensor
         spectrogram = torch.tensor(spectrogram, dtype=torch.float32).unsqueeze(0)

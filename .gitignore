@@ -36,4 +36,6 @@ dev_misc/
 trained_models/
 trained_model/
 datasets/
-
+test_samples/
+detections/
+results/
