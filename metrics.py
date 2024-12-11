@@ -84,6 +84,7 @@ def get_continuous_results(evaluation, reference, threshold=0.5):
     # Filter detections based on the threshold
     # predictions_threshold = evaluation[evaluation['score'] >= threshold]
     predictions_threshold = evaluation
+    reference['label'] = 1
     print(predictions_threshold)
     print(reference)
     unique_classes = reference['label'].unique().tolist()

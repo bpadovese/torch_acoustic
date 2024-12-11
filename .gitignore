@@ -33,8 +33,7 @@ Data
 Data/
 config_files/
 dev_misc/
-trained_models/
-trained_model/
+trained_model*/
 datasets/
 test_samples/
 detections/

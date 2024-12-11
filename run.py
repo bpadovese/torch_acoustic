@@ -12,7 +12,7 @@ from pathlib import Path
 from data_handling.dataset import NormalizeToRange, ConditionalResize
 from torch.utils.data import DataLoader
 from data_handling.spec_preprocessing import classifier_representation
-from train import resnet18_for_single_channel
+from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel
 from dev_utils.detection import filter_by_threshold, merge_overlapping_detections, filter_by_label
 
 def output_function(batch_detections, output_folder, threshold=0.5, merge_detections=False, buffer=None, running_avg=None, labels=None, highest_score_only=False):
@@ -28,6 +28,7 @@ def segment_generator():
     pass 
 
 def process_audio(file_path, config, model, batch_size=32):
+    image_size = 128
     # Initialize dictionary to store lists for each attribute
     predictions_data = {
         "filename": [],
@@ -68,8 +69,8 @@ def process_audio(file_path, config, model, batch_size=32):
                 )
 
                 transform_pipeline = transforms.Compose([
-                    ConditionalResize((128, 128)),
-                    NormalizeToRange(new_min=0, new_max=1)
+                    ConditionalResize((image_size, image_size)),
+                    transforms.ToTensor(),
                 ])
 
                 # Prepare the data for model input
@@ -105,7 +106,7 @@ def load_file_list(file_list_path):
 
     # Use Pandas to read the file
     if file_list_path.suffix in {".txt", ".csv"}:
-        file_list = pd.read_csv(file_list_path, header=None, squeeze=True).tolist()
+        file_list = pd.read_csv(file_list_path, header=None).iloc[:, 0].tolist()
     else:
         raise ValueError("Unsupported file list format. Use .txt or .csv.")
 
@@ -147,9 +148,10 @@ def main(model_file, audio_data, file_list=None, output_folder=None, overwrite=T
     audio_files = []
     for ext in ['*.wav', '*.flac']:
         audio_files.extend(audio_path.rglob(ext))
-
+        
     if file_list is not None:
         file_list = load_file_list(file_list)
+        file_list = [audio_path / Path(file) for file in file_list]
 
         # Normalize and resolve all paths in the file list
         file_list_paths = {Path(f).resolve() for f in file_list}

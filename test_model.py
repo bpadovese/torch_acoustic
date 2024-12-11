@@ -9,13 +9,7 @@ from data_handling.dataset import HDF5Dataset, NormalizeToRange, Standardize, Me
 from torch.utils.data import DataLoader, ConcatDataset
 from torchvision.transforms import transforms
 from pathlib import Path
-
-def resnet18_for_single_channel():
-    model = models.resnet18(weights=None)
-    model.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, 2)
-    return model
+from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel
 
 def select_transform(norm_type, dataset_min=None, dataset_max=None, dataset_mean=None, dataset_std=None):
     match norm_type:

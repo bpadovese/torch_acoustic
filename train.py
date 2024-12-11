@@ -1,11 +1,13 @@
 import time
 import torch
 import torch.nn as nn
-import torchvision.models as models
 import torchvision.transforms as transforms
 import re
+import random
 import numpy as np
-from data_handling.dataset import HDF5Dataset, NormalizeToRange, Standardize, MedianNormalize, ConditionalResize, get_leaf_paths
+import os
+from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel
+from data_handling.dataset import HDF5Dataset, Subset, NormalizeToRange, ImageDataset, MedianNormalize, ConditionalResize, get_leaf_paths
 from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler
 from pathlib import Path
 from collections import defaultdict
@@ -17,18 +19,6 @@ import torcheval.metrics as metrics
 from torch.optim.lr_scheduler import CosineAnnealingLR
 # from torchtune.modules import get_cosine_schedule_with_warmup
 
-
-def resnet18_for_single_channel():
-    model = models.resnet18(weights=None)
-
-    # Modifying the input layer
-    model.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-
-    # Modifying the fully connected layer
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, 2)
-
-    return model
 
 def compute_class_counts(concat_dataset):
     """
@@ -205,7 +195,7 @@ def validate(fabric, model, dataloader, loss_func, num_classes):
     recall = recall[1].item()
     return avg_val_loss, accuracy, precision, recall
 
-def select_transform(norm_type, dataset_min=None, dataset_max=None, dataset_mean=None, dataset_std=None):
+def select_transform(norm_type, image_size):
     match norm_type:
         case 0:
             # No operation (no-op): Do not apply any transformation
@@ -213,36 +203,23 @@ def select_transform(norm_type, dataset_min=None, dataset_max=None, dataset_mean
         case 1:
             # Only resize
             return transforms.Compose([
-                ConditionalResize((128, 128))  # Only resize
+                ConditionalResize((image_size, image_size))  # Only resize
             ])
         case 2:
             # Sample-wise normalization to [0, 1]
             return transforms.Compose([
-                ConditionalResize((128, 128)),
+                ConditionalResize((image_size, image_size)),
                 NormalizeToRange(new_min=0, new_max=1)  # Normalize sample-wise
             ])
         case 3:
-            # Feature-wise normalization to [0, 1]
             return transforms.Compose([
-                ConditionalResize((128, 128)),
-                NormalizeToRange(min_value=dataset_min, max_value=dataset_max, new_min=0, new_max=1)  # Normalize feature-wise
-            ])
-        case 4:
-            # Sample-wise standardization
-            return transforms.Compose([
-                ConditionalResize((128, 128)),
-                Standardize()  # Standardize sample-wise
-            ])
-        case 5:
-            # Feature-wise standardization
-            return transforms.Compose([
-                ConditionalResize((128, 128)),
-                Standardize(mean=dataset_mean, std=dataset_std)  # Standardize feature-wise
+                ConditionalResize((image_size, image_size)),
+                transforms.ToTensor(),
             ])
         case 6:
             # Median normalization along the specified axis
             return transforms.Compose([
-                ConditionalResize((128, 128)),
+                ConditionalResize((image_size, image_size)),
                 MedianNormalize(axis=1)  # Example: row-wise median normalization
             ])
         case _:
@@ -265,8 +242,62 @@ def get_next_version(model_name, output_folder):
     # Return the next version number or 0
     return max(version_numbers, default=-1) + 1
 
-def main(dataset, train_table='/train', aug_table=None, val_table='/test', output_folder=None, train_batch_size=32, eval_batch_size=32, num_epochs=20, model_name='my_model', norm_type=2, norm_type_aug=0, versioning=False, dataset_stats=None):
+def create_balanced_indices(dataset, labels):
+    """
+    Create balanced indices for the HDF5Dataset.
+
+    Args:
+        dataset: An instance of HDF5Dataset.
+        labels: List of labels corresponding to the dataset.
+
+    Returns:
+        List of balanced indices.
+    """
+    # Gather all indices by class
+    class_indices = {}
+    for idx, label in enumerate(labels):
+        class_indices.setdefault(label, []).append(idx)
+
+    # Determine the minimum class size
+    min_count = min(len(indices) for indices in class_indices.values())
+
+    # Randomly sample min_count indices from each class
+    balanced_indices = []
+    for cls, indices in class_indices.items():
+        sampled_relative_indices = torch.randperm(len(indices))[:min_count].tolist()
+        sampled_indices = [indices[i] for i in sampled_relative_indices]  # Map to global indices
+        balanced_indices.extend(sampled_indices)
+
+    return balanced_indices
+
+def count_samples_by_class(dataset):
+    """
+    Count the number of samples per class in a dataset.
+
+    Args:
+        dataset: The dataset to count samples from.
+
+    Returns:
+        A dictionary with class labels as keys and sample counts as values.
+    """
+    from collections import defaultdict
+    class_counts = defaultdict(int)
+    for idx in range(len(dataset)):
+        _, label = dataset[idx]  # Ensure label is correctly accessed
+        class_counts[label] += 1
+    return dict(class_counts)
+
+def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test', output_folder=None, 
+         train_batch_size=32, eval_batch_size=32, num_epochs=20, model_name='my_model', norm_type=2, norm_type_aug=0, 
+         versioning=False, seed=None):
     
+    image_size = 128 # Change this eventually
+    if seed:
+        # Set seeds for reproducibility
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
     if output_folder is None:
         output_folder = Path('.').resolve()
     else:
@@ -289,60 +320,83 @@ def main(dataset, train_table='/train', aug_table=None, val_table='/test', outpu
     else:
         # If versioning is False, always use the same model name
         model_path = output_folder / f"{model_name}.pt"
-   
-    dataset_min = None
-    dataset_max = None
-    dataset_mean = None
-    dataset_std = None
 
-    # Select transforms for the training dataset
-    train_transform = select_transform(norm_type, dataset_min, dataset_max, dataset_mean, dataset_std)
+    if mode == "img":
+        train_transform = select_transform(norm_type, image_size)
 
-    print("Loading train dataset...")
-    train_datasets = []
-    # Handle train_table argument (single path or list of paths)
-    if isinstance(train_table, str):
-        train_table = [train_table]  # Convert to list if it's a single path
-    for path in train_table:
-        leaf_paths = get_leaf_paths(dataset, path)
-        for leaf_path in leaf_paths:
-            train_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
-            train_ds.set_transform(train_transform)
-            train_datasets.append(train_ds)
-    # train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+        train_set = [os.path.normpath(table).lstrip(os.sep) for table in train_set]
+        train_paths = [os.path.join(dataset, table) for table in train_set]
+        # Load images from the folder
+        train_dataset = ImageDataset(paths=train_paths, transform=train_transform)
 
-    print("Loading val dataset...")
-    val_datasets = []
-    # Handle val_table argument (single path or list of paths)
-    if isinstance(val_table, str):
-        val_table = [val_table]  # Convert to list if it's a single path
-    for path in val_table:
-        leaf_paths = get_leaf_paths(dataset, path)
-        for leaf_path in leaf_paths:
-            val_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
-            val_ds.set_transform(train_transform)
-            val_datasets.append(val_ds)
-    test_dataset = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
+        val_set = [os.path.normpath(table).lstrip(os.sep) for table in val_set]
+        val_paths = [os.path.join(dataset, table) for table in val_set]
+        # Load images from the folder
+        test_dataset = ImageDataset(paths=val_paths, transform=train_transform)
 
-    print("Loading augmentation dataset...")
-    # Optional: Handle augmented dataset and apply transforms
-    aug_dataset = None
-    if aug_table:
-        aug_dataset = HDF5Dataset(dataset, aug_table + '/data', transform=None)
-        # Select the transforms for the augmented set
-        aug_transform = select_transform(norm_type_aug, dataset_min, dataset_max, dataset_mean, dataset_std)
-        aug_dataset.set_transform(aug_transform)
-        train_datasets.append(aug_dataset)
-    
+        labels = [train_dataset[idx][1] for idx in range(len(train_dataset))]  # Extract labels
+    else:
 
-    # Concating all train datasets together.
-    train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
-    
-    # Create a WeightedRandomSampler for balanced sampling
-    train_sampler = create_weighted_sampler(train_dataset)
+        # Select transforms for the training dataset
+        train_transform = select_transform(norm_type, image_size)
+
+        print("Loading train dataset...")
+        train_datasets = []
+        # Handle train_set argument (single path or list of paths)
+        if isinstance(train_set, str):
+            train_set = [train_set]  # Convert to list if it's a single path
+        for path in train_set:
+            leaf_paths = get_leaf_paths(dataset, path)
+            for leaf_path in leaf_paths:
+                train_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
+                train_ds.set_transform(train_transform)
+                train_datasets.append(train_ds)
+
+        print("Loading val dataset...")
+        val_datasets = []
+        # Handle val_set argument (single path or list of paths)
+        if isinstance(val_set, str):
+            val_set = [val_set]  # Convert to list if it's a single path
+        for path in val_set:
+            leaf_paths = get_leaf_paths(dataset, path)
+            for leaf_path in leaf_paths:
+                val_ds = HDF5Dataset(dataset, leaf_path, transform=None) 
+                val_ds.set_transform(train_transform)
+                val_datasets.append(val_ds)
+        test_dataset = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
+
+        print("Loading augmentation dataset...")
+        # Optional: Handle augmented dataset and apply transforms
+        aug_dataset = None
+        if aug_set:
+            aug_dataset = HDF5Dataset(dataset, aug_set + '/data', transform=None)
+            # Select the transforms for the augmented set
+            aug_transform = select_transform(norm_type_aug, image_size)
+            aug_dataset.set_transform(aug_transform)
+            train_datasets.append(aug_dataset)
+
+        # Concating all train datasets together.
+        train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+        labels = [train_dataset[idx][1].item() for idx in range(len(train_dataset))]  # Extract labels
+
+    # Create balanced indices after combining datasets
+    print("Creating balanced subset for training dataset...")
+    balanced_indices = create_balanced_indices(train_dataset, labels)  # Generate balanced indices
+
+    # Create a balanced subset of the concatenated dataset
+    balanced_train_dataset = Subset(train_dataset, balanced_indices)
+
+    # balanced_class_counts = count_samples_by_class(balanced_train_dataset)
+    # print("Balanced dataset class counts:", balanced_class_counts)
 
     print("Setting up Fabric...")
-    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=False, sampler=train_sampler, num_workers=4)
+    # train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=False, sampler=train_sampler, num_workers=4)
+    train_loader = DataLoader(
+        balanced_train_dataset,
+        batch_size=train_batch_size,
+        shuffle=True,  # Shuffle within balanced subset
+        num_workers=4,
+    )
     test_loader = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=4)
 
     print("Setting up DataLoaders...")
@@ -388,10 +442,17 @@ if __name__ == "__main__":
         return s == 'True'
     
     parser = argparse.ArgumentParser(description='Train a model on HDF5 dataset.')
-    parser.add_argument('dataset', help='Path to the HDF5 dataset file.')
-    parser.add_argument('--train_table', type=str, nargs='+', default='/train', help='HDF5 table name for training data.')
-    parser.add_argument('--aug_table', type=str, default=None, help='HDF5 table name for augmented data, this assumes a different set of transformations will apply.')
-    parser.add_argument('--val_table', type=str, nargs='+', default='/test', help='HDF5 table name for validation data.')
+    parser.add_argument('dataset', help='Path to the HDF5 dataset file, or root image folder')
+    parser.add_argument('--mode', type=str, choices=['hdf5', 'img'], default='img', help="Specify dataset mode: 'img' for image folders, 'hdf5' for HDF5 datasets.")
+    parser.add_argument('--train_set', type=str, nargs='+', default=None, help=(
+        'For HDF5 mode: table name(s) for training data (e.g., /train).\n'
+        'For img mode: path(s) to training image folders.'))
+    parser.add_argument('--aug_set', type=str, nargs='+', default=None, help=(
+        'For HDF5 mode: table name for augmented data (e.g., /aug).\n'
+        'For img mode: path to folder containing augmented image data.'))
+    parser.add_argument('--val_set', type=str, nargs='+', default=None, help=(
+        'For HDF5 mode: table name(s) for validation data (e.g., /val).\n'
+        'For img mode: path(s) to validation image folders.'))
     parser.add_argument('--output_folder', default=None, type=str, help='Folder to save the trained model.')
     parser.add_argument('--train_batch_size', type=int, default=32, help='Batch size for training.')
     parser.add_argument('--eval_batch_size', type=int, default=32, help='Batch size for evaluation.')
@@ -408,8 +469,10 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs.')
     parser.add_argument('--model_name', type=str, default='my_model', help='name of the model')
     parser.add_argument('--versioning', type=boolean_string, default='False', help='If True, the model name will be versioned (e.g., v_0, v_1, etc.) based on the models already saved in the output path.')
+    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 
     args = parser.parse_args()
-    main(args.dataset, train_table=args.train_table, aug_table=args.aug_table, val_table=args.val_table, output_folder=args.output_folder, 
-         train_batch_size=args.train_batch_size, eval_batch_size=args.eval_batch_size, norm_type=args.norm_type, 
-         norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, model_name=args.model_name, versioning=args.versioning)
+    main(args.dataset, args.mode, train_set=args.train_set, aug_set=args.aug_set, val_set=args.val_set, 
+         output_folder=args.output_folder, train_batch_size=args.train_batch_size, eval_batch_size=args.eval_batch_size, 
+         norm_type=args.norm_type, norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, 
+         model_name=args.model_name, versioning=args.versioning, seed=args.seed)

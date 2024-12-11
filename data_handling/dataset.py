@@ -1,7 +1,10 @@
 import tables
 import torch
+import os
+from PIL import Image
 from torchvision import transforms
 from torch.utils.data import Dataset
+from torchvision.datasets import DatasetFolder
 
 def get_leaf_paths(hdf5_file, table_path):
     with tables.open_file(hdf5_file, mode='r') as file:
@@ -16,6 +19,49 @@ def get_leaf_paths(hdf5_file, table_path):
                 
         return leaf_paths
     
+class ImageDataset(DatasetFolder):
+    def __init__(self, paths, transform=None, target_transform=None):
+        """
+        Generic dataset for combining folders dynamically for any class.
+
+        Args:
+            paths (list): List of folder paths to include in the dataset.
+                          The label is inferred from the last subfolder (e.g., '.../0', '.../1').
+            transform (callable, optional): Transformation to apply to the input data.
+            target_transform (callable, optional): Transformation to apply to the target labels.
+        """
+        self.paths = paths
+        self.transform = transform
+        self.target_transform = target_transform
+
+        # Collect all files and their inferred labels
+        self.samples = self._make_dataset()
+
+    def _make_dataset(self):
+        samples = []
+        for folder_path in self.paths:
+            if os.path.isdir(folder_path):
+                # Infer the label from the last subfolder
+                label = int(os.path.basename(folder_path))
+                for root, _, filenames in os.walk(folder_path):
+                    for filename in filenames:
+                        path = os.path.join(root, filename)
+                        samples.append((path, label))
+        return samples
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        sample = Image.open(path)  # Adjust if not working with images
+        if self.transform:
+            sample = self.transform(sample)
+        if self.target_transform:
+            target = self.target_transform(target)
+        return sample, target
+
+    def __len__(self):
+        return len(self.samples)
+
+
 class HDF5Dataset(Dataset):
     def __init__(self, hdf5_file, table_name, transform=None):
         self.hdf5_file = hdf5_file
@@ -51,6 +97,17 @@ class HDF5Dataset(Dataset):
 
     def set_transform(self, transform):
         self.transform = transform
+    
+class Subset(Dataset):
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]]
 
 class NormalizeToRange:
     def __init__(self, min_value=None, max_value=None, new_min=0, new_max=1):
