@@ -6,9 +6,10 @@ import re
 import random
 import numpy as np
 import os
+from math import floor
 from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel
 from data_handling.dataset import HDF5Dataset, Subset, NormalizeToRange, ImageDataset, MedianNormalize, ConditionalResize, get_leaf_paths
-from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, ConcatDataset, SubsetRandomSampler
 from pathlib import Path
 from collections import defaultdict
 from torchinfo import summary
@@ -48,41 +49,6 @@ def compute_class_counts(concat_dataset):
         class_counts[first_label] += table_size
     
     return labels, class_counts
-
-def create_weighted_sampler(datasets):
-    """
-    Create a WeightedRandomSampler based on class counts.
-
-    Args:
-        class_counts: Dictionary of class counts.
-
-    Returns:
-        WeightedRandomSampler object.
-    """
-
-    labels, class_counts = compute_class_counts(datasets)
-
-    # Calculate class weights (inverse of frequency)
-    total_samples = sum(class_counts.values())
-    class_weights = {cls: total_samples / count for cls, count in class_counts.items()}
-
-    # Assign sample weights based on class weights
-    sample_weights = torch.tensor(
-        [class_weights[label] for label in labels], dtype=torch.float
-    )
-
-    # Calculate num_samples: minimum class count times the number of classes
-    min_class_count = min(class_counts.values())
-    num_samples = int(min_class_count * len(class_counts))   # Total samples to draw per epoch
-
-    # Create the WeightedRandomSampler
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=num_samples,  # Total number of samples
-        replacement=False
-    )
-
-    return sampler
 
 def train(fabric, model, optimizer, loss_func, train_loader, lr_scheduler=None, val_loader=None, num_epochs=20, num_classes=2):
     print("Training starting...")
@@ -195,7 +161,7 @@ def validate(fabric, model, dataloader, loss_func, num_classes):
     recall = recall[1].item()
     return avg_val_loss, accuracy, precision, recall
 
-def select_transform(norm_type, image_size):
+def select_transform(norm_type, input_shape):
     match norm_type:
         case 0:
             # No operation (no-op): Do not apply any transformation
@@ -203,23 +169,23 @@ def select_transform(norm_type, image_size):
         case 1:
             # Only resize
             return transforms.Compose([
-                ConditionalResize((image_size, image_size))  # Only resize
+                ConditionalResize(input_shape)  # Only resize
             ])
         case 2:
             # Sample-wise normalization to [0, 1]
             return transforms.Compose([
-                ConditionalResize((image_size, image_size)),
+                ConditionalResize(input_shape),
                 NormalizeToRange(new_min=0, new_max=1)  # Normalize sample-wise
             ])
         case 3:
             return transforms.Compose([
-                ConditionalResize((image_size, image_size)),
+                ConditionalResize(input_shape),
                 transforms.ToTensor(),
             ])
         case 6:
             # Median normalization along the specified axis
             return transforms.Compose([
-                ConditionalResize((image_size, image_size)),
+                ConditionalResize(input_shape),
                 MedianNormalize(axis=1)  # Example: row-wise median normalization
             ])
         case _:
@@ -242,13 +208,12 @@ def get_next_version(model_name, output_folder):
     # Return the next version number or 0
     return max(version_numbers, default=-1) + 1
 
-def create_balanced_indices(dataset, labels):
+def create_balanced_indices(labels):
     """
-    Create balanced indices for the HDF5Dataset.
+    Create balanced indices for each label.
 
     Args:
-        dataset: An instance of HDF5Dataset.
-        labels: List of labels corresponding to the dataset.
+        labels: List of labels.
 
     Returns:
         List of balanced indices.
@@ -264,6 +229,9 @@ def create_balanced_indices(dataset, labels):
     # Randomly sample min_count indices from each class
     balanced_indices = []
     for cls, indices in class_indices.items():
+        # randperm will create a tensor length indices with random integers from 0 to len(indices).
+        # From this tensor we will take the first min_count indices which effectively corresponds to
+        # sampling min_count indicies (similar behaviour to numpy.random.choice)
         sampled_relative_indices = torch.randperm(len(indices))[:min_count].tolist()
         sampled_indices = [indices[i] for i in sampled_relative_indices]  # Map to global indices
         balanced_indices.extend(sampled_indices)
@@ -287,11 +255,30 @@ def count_samples_by_class(dataset):
         class_counts[label] += 1
     return dict(class_counts)
 
-def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test', output_folder=None, 
-         train_batch_size=32, eval_batch_size=32, num_epochs=20, model_name='my_model', norm_type=2, norm_type_aug=0, 
-         versioning=False, seed=None):
+def create_per_class_datasets(paths, transform=None):
+    """
+    Returns a dict of {class_label: ImageDataset}
+    """
+    paths_by_class = defaultdict(list)
+    for folder_path in paths:
+        if os.path.isdir(folder_path):
+            # Infer the label from the last subfolder
+            label = int(os.path.basename(folder_path))
+            paths_by_class[label].append(folder_path)
     
-    image_size = 128 # Change this eventually
+    datasets = []
+    for class_label, folder_paths in paths_by_class.items():
+        datasets.append(ImageDataset(
+            paths=folder_paths, 
+            label=class_label, 
+            transform=transform
+        ))
+    return datasets 
+
+def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test', output_folder=None, 
+         train_batch_size=32, input_shape=(128,128), eval_batch_size=32, num_epochs=20, model_name='my_model', norm_type=2, norm_type_aug=0, 
+         versioning=False, seed=None):
+
     if seed:
         # Set seeds for reproducibility
         torch.manual_seed(seed)
@@ -322,23 +309,26 @@ def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test',
         model_path = output_folder / f"{model_name}.pt"
 
     if mode == "img":
-        train_transform = select_transform(norm_type, image_size)
+        train_transform = select_transform(norm_type, input_shape)
 
         train_set = [os.path.normpath(table).lstrip(os.sep) for table in train_set]
         train_paths = [os.path.join(dataset, table) for table in train_set]
-        # Load images from the folder
-        train_dataset = ImageDataset(paths=train_paths, transform=train_transform)
 
+        train_datasets = create_per_class_datasets(train_paths, transform=train_transform)
+        train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+        
         val_set = [os.path.normpath(table).lstrip(os.sep) for table in val_set]
         val_paths = [os.path.join(dataset, table) for table in val_set]
         # Load images from the folder
-        test_dataset = ImageDataset(paths=val_paths, transform=train_transform)
+
+        test_datasets = create_per_class_datasets(val_paths, transform=train_transform)
+        test_dataset = ConcatDataset(test_datasets) if len(test_datasets) > 1 else test_datasets[0]
 
         labels = [train_dataset[idx][1] for idx in range(len(train_dataset))]  # Extract labels
     else:
 
         # Select transforms for the training dataset
-        train_transform = select_transform(norm_type, image_size)
+        train_transform = select_transform(norm_type, input_shape)
 
         print("Loading train dataset...")
         train_datasets = []
@@ -365,46 +355,37 @@ def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test',
                 val_datasets.append(val_ds)
         test_dataset = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
 
-        print("Loading augmentation dataset...")
-        # Optional: Handle augmented dataset and apply transforms
-        aug_dataset = None
-        if aug_set:
-            aug_dataset = HDF5Dataset(dataset, aug_set + '/data', transform=None)
-            # Select the transforms for the augmented set
-            aug_transform = select_transform(norm_type_aug, image_size)
-            aug_dataset.set_transform(aug_transform)
-            train_datasets.append(aug_dataset)
-
         # Concating all train datasets together.
         train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
         labels = [train_dataset[idx][1].item() for idx in range(len(train_dataset))]  # Extract labels
 
     # Create balanced indices after combining datasets
     print("Creating balanced subset for training dataset...")
-    balanced_indices = create_balanced_indices(train_dataset, labels)  # Generate balanced indices
+    balanced_indices = create_balanced_indices(labels)  # Generate balanced indices
 
     # Create a balanced subset of the concatenated dataset
-    balanced_train_dataset = Subset(train_dataset, balanced_indices)
+    # balanced_train_dataset = Subset(train_dataset, balanced_indices)
 
     # balanced_class_counts = count_samples_by_class(balanced_train_dataset)
     # print("Balanced dataset class counts:", balanced_class_counts)
 
     print("Setting up Fabric...")
-    # train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=False, sampler=train_sampler, num_workers=4)
     train_loader = DataLoader(
-        balanced_train_dataset,
+        train_dataset,
         batch_size=train_batch_size,
-        shuffle=True,  # Shuffle within balanced subset
+        sampler=SubsetRandomSampler(balanced_indices),
+        shuffle=False, 
         num_workers=4,
     )
     test_loader = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False, num_workers=4)
 
     print("Setting up DataLoaders...")
-    train_loader, test_loader = fabric.setup_dataloaders(train_loader, test_loader)
-    
+    train_loader, test_loader = fabric.setup_dataloaders(train_loader, test_loader)   
 
     # Modify the ResNet-18 model for single-channel input
     model = resnet18_for_single_channel()
+    # print(model)
+    # model = AdvPropSingleChannel(model)
     loss_func = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, betas=(0.9, 0.999), weight_decay=0)
 
@@ -467,12 +448,21 @@ if __name__ == "__main__":
     ))
     parser.add_argument('--norm_type_aug', type=int, default=0, help='Norm that will apply for the augmetned data')
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs.')
+    parser.add_argument('--input_shape', type=int, nargs='+', default=[128, 128], help='Input shape as width and height (e.g., --input_shape 128 128).')
     parser.add_argument('--model_name', type=str, default='my_model', help='name of the model')
     parser.add_argument('--versioning', type=boolean_string, default='False', help='If True, the model name will be versioned (e.g., v_0, v_1, etc.) based on the models already saved in the output path.')
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 
     args = parser.parse_args()
+
+    if len(args.input_shape) == 1:
+        input_shape = (args.input_shape[0], args.input_shape[0])
+    elif len(args.input_shape) == 2:
+        input_shape = tuple(args.input_shape) #convert to tuple
+    else:
+        parser.error("--input_shape must be one or two integers.")
+
     main(args.dataset, args.mode, train_set=args.train_set, aug_set=args.aug_set, val_set=args.val_set, 
          output_folder=args.output_folder, train_batch_size=args.train_batch_size, eval_batch_size=args.eval_batch_size, 
-         norm_type=args.norm_type, norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, 
+         norm_type=args.norm_type, norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, input_shape=input_shape,
          model_name=args.model_name, versioning=args.versioning, seed=args.seed)

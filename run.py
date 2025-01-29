@@ -27,8 +27,7 @@ def segment_generator():
     
     pass 
 
-def process_audio(file_path, config, model, batch_size=32):
-    image_size = 128
+def process_audio(file_path, config, model, input_shape, batch_size=32):
     # Initialize dictionary to store lists for each attribute
     predictions_data = {
         "filename": [],
@@ -69,13 +68,19 @@ def process_audio(file_path, config, model, batch_size=32):
                 )
 
                 transform_pipeline = transforms.Compose([
-                    ConditionalResize((image_size, image_size)),
+                    ConditionalResize(input_shape),
                     transforms.ToTensor(),
                 ])
+                
+                # Assuming `representation_data` is the PIL Image from classifier_representation
+                processed_segment = transform_pipeline(representation_data)
 
-                # Prepare the data for model input
-                input_tensor = torch.from_numpy(representation_data).unsqueeze(0).unsqueeze(0).float()  # Add batch dimension
-                input_tensor = transform_pipeline(input_tensor)  # Apply all transformations
+                # Add batch dimension for model input
+                input_tensor = processed_segment.unsqueeze(0)  # Shape: (1, C, H, W)
+
+                # # Prepare the data for model input
+                # input_tensor = torch.from_numpy(representation_data).unsqueeze(0).unsqueeze(0).float()  # Add batch dimension
+                # input_tensor = transform_pipeline(input_tensor)  # Apply all transformations
 
                 logits = model(input_tensor)
                 # cpu will move a tensor from the GPU to the CPU
@@ -112,20 +117,17 @@ def load_file_list(file_list_path):
 
     return file_list
 
-def main(model_file, audio_data, file_list=None, output_folder=None, overwrite=True, step_size=None, threshold=0.5, labels=None, merge_detections=False, buffer=0.0):
+def main(model_file, audio_data, audio_representation, file_list=None, output_folder=None, 
+         input_shape=(128,128), overwrite=True, step_size=None, threshold=0.5, labels=None, merge_detections=False, buffer=0.0):
     # Load your pre-trained model
     model = resnet18_for_single_channel()
     fabric = Fabric()
     state = fabric.load(model_file)
-    # "trained_models/time_shift/sample_normalize/rb/my_model_v0.pt"
 
     model.load_state_dict(state["model"])
     # device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # model = model.to(device)
     model.eval()
-    
-
-    audio_representation = "common/config_files/spec_config.json"
 
     if output_folder is None:
         output_folder = Path('.').resolve()
@@ -162,7 +164,7 @@ def main(model_file, audio_data, file_list=None, output_folder=None, overwrite=T
     # Initialize tqdm with the total segment count
     with tqdm(total=len(audio_files), desc="Processing Audio Files") as pbar:
         for file_path in audio_files:
-            file_predictions = process_audio(file_path, config, model)
+            file_predictions = process_audio(file_path, config, model, input_shape=input_shape)
             
             # Update tqdm for each processed file
             pbar.update(1)
@@ -215,6 +217,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('model_file', type=str, help='Path to the torch model file (*.pt)')
     parser.add_argument('audio_data', type=str, help='Path to either a folder with audio files.')
+    parser.add_argument('audio_representation', type=str, help='Path to the audio representation config file')
     parser.add_argument('--file_list', default=None, type=str, help='A .csv or .txt file where each row (or line) is the name of a file to detect within the audio folder. \
                         By default, all files will be processed.')
     parser.add_argument('--output_folder', default=None, type=str, help='Location to output the detections. For instance: detections/')
@@ -222,11 +225,21 @@ if __name__ == "__main__":
     parser.add_argument('--step_size', default=None, type=float, help='Step size in seconds. If not specified, the step size is set equal to the duration of the audio representation.')
     parser.add_argument('--threshold', default=0.5, type=float, help="The threshold value used to determine the cut-off point for detections. This is a floating-point value between 0 and 1. A detection is considered positive if its score is above this threshold. The default value is 0.5.")
     parser.add_argument('--labels', type=tryeval, default=None, help="List or integer of labels to filter by. Example usage: --labels 1 or --labels [1,2,3]. Defaults to None.")
+    parser.add_argument('--input_shape', type=int, nargs='+', default=[128, 128], help='Input shape as width and height (e.g., --input_shape 128 128).')
     parser.add_argument('--merge_detections', default=False, type=boolean_string, 
                     help="A flag indicating whether to merge overlapping detections into a single detection. If set to True, overlapping detections are merged. The default value is False, meaning detections are kept separate.")
     parser.add_argument('--buffer', default=0.0, type=float, 
                     help="The buffer duration to be added to each detection in seconds. This helps to extend the start and end times of each detection to include some context around the detected event. The default value is 0.0, which means no buffer is added.")
     
     args = parser.parse_args()
-    main(args.model_file, args.audio_data, file_list=args.file_list, output_folder=args.output_folder, overwrite=args.overwrite, 
-         step_size=args.step_size, threshold=args.threshold, labels=args.labels, merge_detections=args.merge_detections, buffer=args.buffer)
+
+    if len(args.input_shape) == 1:
+        input_shape = (args.input_shape[0], args.input_shape[0])
+    elif len(args.input_shape) == 2:
+        input_shape = tuple(args.input_shape) #convert to tuple
+    else:
+        parser.error("--input_shape must be one or two integers.")
+
+    main(args.model_file, args.audio_data, args.audio_representation, file_list=args.file_list, 
+         output_folder=args.output_folder, overwrite=args.overwrite, step_size=args.step_size, input_shape=input_shape, 
+         threshold=args.threshold, labels=args.labels, merge_detections=args.merge_detections, buffer=args.buffer)

@@ -20,29 +20,25 @@ def get_leaf_paths(hdf5_file, table_path):
         return leaf_paths
     
 class ImageDataset(DatasetFolder):
-    def __init__(self, paths, transform=None, target_transform=None):
+    def __init__(self, paths, label, transform=None):
         """
         Generic dataset for combining folders dynamically for any class.
 
         Args:
             paths (list): List of folder paths to include in the dataset.
                           The label is inferred from the last subfolder (e.g., '.../0', '.../1').
+            label: the numeric label to use for all these folders
             transform (callable, optional): Transformation to apply to the input data.
-            target_transform (callable, optional): Transformation to apply to the target labels.
         """
-        self.paths = paths
         self.transform = transform
-        self.target_transform = target_transform
-
         # Collect all files and their inferred labels
-        self.samples = self._make_dataset()
+        self.samples = self._make_dataset(paths, label)
 
-    def _make_dataset(self):
+    def _make_dataset(self, paths, label):
         samples = []
-        for folder_path in self.paths:
+        for folder_path in paths:
             if os.path.isdir(folder_path):
-                # Infer the label from the last subfolder
-                label = int(os.path.basename(folder_path))
+                # We already know the label from `label` param
                 for root, _, filenames in os.walk(folder_path):
                     for filename in filenames:
                         path = os.path.join(root, filename)
@@ -54,8 +50,6 @@ class ImageDataset(DatasetFolder):
         sample = Image.open(path)  # Adjust if not working with images
         if self.transform:
             sample = self.transform(sample)
-        if self.target_transform:
-            target = self.target_transform(target)
         return sample, target
 
     def __len__(self):
