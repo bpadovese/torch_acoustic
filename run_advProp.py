@@ -4,7 +4,6 @@ import soundfile as sf
 import json
 import librosa
 import pandas as pd
-import noisereduce as nr
 from tqdm import tqdm
 from torch.nn.functional import sigmoid
 from torchvision import transforms
@@ -13,7 +12,7 @@ from pathlib import Path
 from data_handling.dataset import NormalizeToRange, ConditionalResize
 from torch.utils.data import DataLoader
 from data_handling.spec_preprocessing import classifier_representation
-from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel, get_resnet34_model, get_efficientnet_b0_model
+from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel, AdvPropResNet
 from dev_utils.detection import filter_by_threshold, merge_overlapping_detections, filter_by_label
 
 def output_function(batch_detections, output_folder, threshold=0.5, merge_detections=False, buffer=None, running_avg=None, labels=None, highest_score_only=False):
@@ -49,27 +48,19 @@ def process_audio(file_path, config, model, input_shape, batch_size=32):
                 end_sample = min(start_sample + segment_length, audio_file.frames)  # Ensure bounds are not exceeded
                 start_time = start_sample / sr  # Convert start sample to time in seconds
                 end_time = end_sample / sr      # Convert end sample to time in seconds
-
-                # Ignore tiny segments
-                if end_time - start_time < 0.01:
-                    continue
-
-
+    
                 # Read only the current segment
                 audio_file.seek(start_sample)  # Move to the start of the segment
                 segment = audio_file.read(end_sample - start_sample)
 
                 # Pad if the last segment is shorter than the required duration
                 if len(segment) < segment_length:
-                    # segment = np.pad(segment, (0, segment_length - len(segment)), mode='constant', constant_values=0)
-                    segment = np.pad(segment, (0, segment_length - len(segment)), mode='reflect')
+                        segment = np.pad(segment, (0, segment_length - len(segment)), mode='constant', constant_values=0)
 
                 # Resample the audio segment if new sample rate is provided and different from the original
                 if config['sr'] is not None and config['sr'] != sr:
                     segment = librosa.resample(segment, orig_sr=sr, target_sr=config['sr'])
-                
-                # segment = nr.reduce_noise(y=segment, sr=config['sr'])
-                
+
                 # Convert the audio segment to the model's expected representation
                 representation_data = classifier_representation(
                     segment, config["window"], config["step"], config['sr'], config["num_filters"], 
@@ -129,9 +120,8 @@ def load_file_list(file_list_path):
 def main(model_file, audio_data, audio_representation, file_list=None, output_folder=None, 
          input_shape=(128,128), overwrite=True, step_size=None, threshold=0.5, labels=None, merge_detections=False, buffer=0.0):
     # Load your pre-trained model
-    model = resnet18_for_single_channel()
-    # model = get_efficientnet_b0_model()
-    # model = resnet50_for_single_channel()
+    base_model = resnet18_for_single_channel()
+    model = AdvPropResNet(base_model)
     fabric = Fabric()
     state = fabric.load(model_file)
 
@@ -173,12 +163,10 @@ def main(model_file, audio_data, audio_representation, file_list=None, output_fo
         audio_files = [audio_file for audio_file in audio_files if Path(audio_file).resolve() in file_list_paths]
 
     raw_predictions_list = []
-
     # Initialize tqdm with the total segment count
     with tqdm(total=len(audio_files), desc="Processing Audio Files") as pbar:
         for file_path in audio_files:
             file_predictions = process_audio(file_path, config, model, input_shape=input_shape)
-            
             raw_predictions_list.append(file_predictions)
             # Update tqdm for each processed file
             pbar.update(1)
@@ -190,7 +178,7 @@ def main(model_file, audio_data, audio_representation, file_list=None, output_fo
 
             if merge_detections:
                 file_predictions = merge_overlapping_detections(file_predictions)
- 
+
             header = True if mode == "w" else False
             output = (output_folder / "detections.csv")
             if not file_predictions.empty:
@@ -203,6 +191,7 @@ def main(model_file, audio_data, audio_representation, file_list=None, output_fo
             
             mode = 'a'
         
+                
         raw_df = pd.DataFrame(columns=['filename', 'start', 'end', 'score', 'label'])
         for preds in raw_predictions_list:
             scores = []

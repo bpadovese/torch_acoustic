@@ -34,9 +34,20 @@ class ImageDataset(DatasetFolder):
         # Collect all files and their inferred labels
         self.samples = self._make_dataset(paths, label)
 
+        if not self.samples:
+            raise ValueError(f"No valid samples found in provided paths: {paths}")
+        
     def _make_dataset(self, paths, label):
         samples = []
         for folder_path in paths:
+
+            if not os.path.exists(folder_path):
+                raise FileNotFoundError(f"Dataset path does not exist: {folder_path}")
+
+            if not os.path.isdir(folder_path):
+                raise NotADirectoryError(f"Expected a directory but got a file: {folder_path}")
+
+            # Collect all valid files
             if os.path.isdir(folder_path):
                 # We already know the label from `label` param
                 for root, _, filenames in os.walk(folder_path):

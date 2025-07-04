@@ -1,13 +1,13 @@
 import time
 import torch
+import sys
 import torch.nn as nn
-import torchvision.transforms as transforms
 import re
 import random
 import numpy as np
 import os
-from math import floor
-from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel
+from torchvision import transforms
+from dev_utils.nn import resnet18_for_single_channel, resnet50_for_single_channel, get_resnet34_model, get_efficientnet_b0_model
 from data_handling.dataset import HDF5Dataset, Subset, NormalizeToRange, ImageDataset, MedianNormalize, ConditionalResize, get_leaf_paths
 from torch.utils.data import DataLoader, ConcatDataset, SubsetRandomSampler
 from pathlib import Path
@@ -238,44 +238,58 @@ def create_balanced_indices(labels):
 
     return balanced_indices
 
-def count_samples_by_class(dataset):
+def count_samples_by_class(indices, dataset):
     """
-    Count the number of samples per class in a dataset.
+    Count the number of samples per class in a dataset, based on selected indices.
 
     Args:
+        indices (list): List of indices to consider.
         dataset: The dataset to count samples from.
 
     Returns:
-        A dictionary with class labels as keys and sample counts as values.
+        dict: Dictionary with class labels as keys and sample counts as values.
     """
-    from collections import defaultdict
     class_counts = defaultdict(int)
-    for idx in range(len(dataset)):
-        _, label = dataset[idx]  # Ensure label is correctly accessed
+    for idx in indices:
+        _, label = dataset[idx]  # Extract label correctly
         class_counts[label] += 1
     return dict(class_counts)
 
-def create_per_class_datasets(paths, transform=None):
-    """
-    Returns a dict of {class_label: ImageDataset}
-    """
-    paths_by_class = defaultdict(list)
-    for folder_path in paths:
-        if os.path.isdir(folder_path):
-            # Infer the label from the last subfolder
-            label = int(os.path.basename(folder_path))
-            paths_by_class[label].append(folder_path)
+def create_per_class_datasets(paths, transform=None, num_samples_per_dataset=None):
+    """ 
+    Returns a list of datasets, each corersponding to a different class, with an optional balanced sampling.
     
+    Args:
+        paths (list): List of folder paths containing class data.
+        transform (callable, optional): Transformations applied to the data.
+        num_samples_per_class (int, optional): Number of samples to take per class.
+        
+    Returns:
+        list: List of datasets, each corresponding to a specific class.
+    """
     datasets = []
-    for class_label, folder_paths in paths_by_class.items():
-        datasets.append(ImageDataset(
-            paths=folder_paths, 
-            label=class_label, 
-            transform=transform
-        ))
+    
+    for i, folder_path in enumerate(paths):
+        if not os.path.exists(folder_path):
+                raise FileNotFoundError(f"Dataset path does not exist: {folder_path}")
+
+        if not os.path.isdir(folder_path):
+            raise NotADirectoryError(f"Expected a directory but got a file: {folder_path}")
+        
+        label = int(os.path.basename(folder_path))  # Label is inferred from folder name
+        dataset = ImageDataset(paths=[folder_path], label=label, transform=transform)
+
+        # Sample a fixed number of instances if specified
+        if num_samples_per_dataset is not None and num_samples_per_dataset[i] is not None:
+            num_samples = min(num_samples_per_dataset[i], len(dataset))
+            sampled_indices = random.sample(range(len(dataset)), num_samples)
+            dataset = Subset(dataset, sampled_indices)
+
+        datasets.append(dataset)
+
     return datasets 
 
-def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test', output_folder=None, 
+def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test', num_samples_per_dataset=None, output_folder=None, 
          train_batch_size=32, input_shape=(128,128), eval_batch_size=32, num_epochs=20, model_name='my_model', norm_type=2, norm_type_aug=0, 
          versioning=False, seed=None):
 
@@ -314,7 +328,7 @@ def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test',
         train_set = [os.path.normpath(table).lstrip(os.sep) for table in train_set]
         train_paths = [os.path.join(dataset, table) for table in train_set]
 
-        train_datasets = create_per_class_datasets(train_paths, transform=train_transform)
+        train_datasets = create_per_class_datasets(train_paths, transform=train_transform, num_samples_per_dataset=num_samples_per_dataset)
         train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
         
         val_set = [os.path.normpath(table).lstrip(os.sep) for table in val_set]
@@ -366,7 +380,7 @@ def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test',
     # Create a balanced subset of the concatenated dataset
     # balanced_train_dataset = Subset(train_dataset, balanced_indices)
 
-    # balanced_class_counts = count_samples_by_class(balanced_train_dataset)
+    # balanced_class_counts = count_samples_by_class(balanced_indices, train_dataset)
     # print("Balanced dataset class counts:", balanced_class_counts)
 
     print("Setting up Fabric...")
@@ -384,8 +398,10 @@ def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test',
 
     # Modify the ResNet-18 model for single-channel input
     model = resnet18_for_single_channel()
+    # model = get_efficientnet_b0_model()
+    # model = resnet50_for_single_channel()
+    
     # print(model)
-    # model = AdvPropSingleChannel(model)
     loss_func = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, betas=(0.9, 0.999), weight_decay=0)
 
@@ -413,6 +429,15 @@ def main(dataset, mode='img', train_set='/train', aug_set=None, val_set='/test',
     
     print('Finished Training')
 
+# Save command to file
+def save_command(output_folder):
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    command_str = ' '.join(sys.argv)
+    with open(output_folder / "command.txt", 'w') as f:
+        f.write(command_str + '\n')
+
 # Example usage
 if __name__ == "__main__":
     import argparse
@@ -422,6 +447,10 @@ if __name__ == "__main__":
             raise ValueError('Not a valid boolean string')
         return s == 'True'
     
+    def parse_num_samples(value):
+        """Convert 'None' to None and other values to integers."""
+        return None if value.lower() == 'none' else int(value)
+
     parser = argparse.ArgumentParser(description='Train a model on HDF5 dataset.')
     parser.add_argument('dataset', help='Path to the HDF5 dataset file, or root image folder')
     parser.add_argument('--mode', type=str, choices=['hdf5', 'img'], default='img', help="Specify dataset mode: 'img' for image folders, 'hdf5' for HDF5 datasets.")
@@ -434,6 +463,7 @@ if __name__ == "__main__":
     parser.add_argument('--val_set', type=str, nargs='+', default=None, help=(
         'For HDF5 mode: table name(s) for validation data (e.g., /val).\n'
         'For img mode: path(s) to validation image folders.'))
+    parser.add_argument('--num_samples_per_dataset', type=parse_num_samples, nargs='+', default=None, help="List specifying the number of samples to extract from each dataset. If None, extract all samples.")
     parser.add_argument('--output_folder', default=None, type=str, help='Folder to save the trained model.')
     parser.add_argument('--train_batch_size', type=int, default=32, help='Batch size for training.')
     parser.add_argument('--eval_batch_size', type=int, default=32, help='Batch size for evaluation.')
@@ -462,7 +492,10 @@ if __name__ == "__main__":
     else:
         parser.error("--input_shape must be one or two integers.")
 
+    save_command(args.output_folder)
+
     main(args.dataset, args.mode, train_set=args.train_set, aug_set=args.aug_set, val_set=args.val_set, 
-         output_folder=args.output_folder, train_batch_size=args.train_batch_size, eval_batch_size=args.eval_batch_size, 
-         norm_type=args.norm_type, norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, input_shape=input_shape,
+         num_samples_per_dataset= args.num_samples_per_dataset, output_folder=args.output_folder, 
+         train_batch_size=args.train_batch_size, eval_batch_size=args.eval_batch_size, norm_type=args.norm_type, 
+         norm_type_aug=args.norm_type_aug, num_epochs=args.num_epochs, input_shape=input_shape, 
          model_name=args.model_name, versioning=args.versioning, seed=args.seed)
